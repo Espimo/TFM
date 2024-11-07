@@ -1,0 +1,141 @@
+# 001_crear_job_id.py
+import os
+import pandas as pd
+from utils import create_job_id_mapping, merge_datasets
+
+# Load data
+linkedin_job_postings = pd.read_csv('linkedin_job_postings.csv')
+linkedin_job_summary = pd.read_csv('linkedin_job_summary.csv')
+linkedin_job_skills = pd.read_csv('linkedin_job_skills.csv')
+
+# Create job_id mapping and merge datasets
+job_link_to_id = create_job_id_mapping(linkedin_job_postings)
+linkedin_job_summary = merge_datasets(linkedin_job_summary, job_link_to_id)
+linkedin_job_skills = merge_datasets(linkedin_job_skills, job_link_to_id)
+
+# Save processed files
+linkedin_job_postings.to_csv('job_postings.csv', index=False)
+linkedin_job_summary.to_csv('job_summary.csv', index=False)
+linkedin_job_skills.to_csv('job_skills.csv', index=False)
+
+print("Step 1 complete: Created job_id mapping and saved cleaned datasets.")
+
+
+# 002_detectar_idioma_paralel.py
+from utils import detect_language_in_parallel
+
+df = pd.read_csv('linkedin_job_summary.csv')
+df['job_summary_language'] = detect_language_in_parallel(df['job_summary'])
+df_english = df[df['job_summary_language'] == 'en']
+df_english.to_csv('job_summary_english.csv', index=False)
+
+print("Step 2 complete: Language detection applied, saved English-only summaries.")
+
+
+# 003_filtrando_otros_datasets.py
+from utils import filter_datasets_by_job_ids
+
+job_summary_ready = pd.read_csv('job_summary_ready.csv')
+job_ids = job_summary_ready['job_id'].unique()
+
+job_postings_ready = filter_datasets_by_job_ids(
+    pd.read_csv('linkedin_job_postings_with_id.csv'), job_ids
+)
+job_skills_ready = filter_datasets_by_job_ids(
+    pd.read_csv('linkedin_job_skills_with_id.csv'), job_ids
+)
+
+job_postings_ready.to_csv('job_postings_ready.csv', index=False)
+job_skills_ready.to_csv('job_skills_ready.csv', index=False)
+
+print("Step 3 complete: Filtered datasets saved.")
+
+
+# 004_eliminar_registros_faltantes.py
+from utils import filter_by_job_skills
+
+job_postings = pd.read_csv('job_postings.csv')
+job_skills = pd.read_csv('job_skills.csv')
+job_summary = pd.read_csv('job_summary.csv')
+
+filtered_job_postings = filter_by_job_skills(job_postings, job_skills)
+filtered_job_summary = filter_by_job_skills(job_summary, job_skills)
+
+filtered_job_postings.to_csv('filtered_job_postings.csv', index=False)
+filtered_job_summary.to_csv('filtered_job_summary.csv', index=False)
+
+print("Step 4 complete: Filtered job postings and summaries saved.")
+
+
+# 005_guardar_job_link_id.py
+from utils import save_job_link_id
+
+job_skills_filtered = pd.read_csv('job_skills.csv')[['job_id', 'job_link']].sort_values(by='job_id')
+save_job_link_id(job_skills_filtered, 'job_skills_sorted.csv')
+
+print("Step 5 complete: Saved job_id and job_link sorted.")
+
+
+# 006_eliminar_columna.py
+from utils import drop_columns
+
+job_summary = pd.read_csv('job_summary.csv')
+job_summary = drop_columns(job_summary, ['job_summary_language', 'job_link'])
+job_summary.to_csv('job_summary_ok.csv', index=False)
+
+print("Step 6 complete: Dropped columns from job_summary.")
+
+
+# 007_borrar_nulos.py
+from utils import drop_null_rows
+
+df = pd.read_csv('job_skills_ok.csv')
+df_cleaned = drop_null_rows(df)
+df_cleaned.to_csv('job_skills_cleaned.csv', index=False)
+
+print("Step 7 complete: Removed null values from job_skills.")
+
+
+# 008_eliminar_registros.py
+from utils import filter_datasets_by_job_ids
+
+job_skills = pd.read_csv('job_skills_cleaned.csv')
+job_summary = pd.read_csv('job_summary_ok.csv')
+job_postings = pd.read_csv('job_postings_ok.csv')
+
+job_summary_filtered = filter_datasets_by_job_ids(job_summary, job_skills['job_id'])
+job_postings_filtered = filter_datasets_by_job_ids(job_postings, job_skills['job_id'])
+
+job_summary_filtered.to_csv('job_summary_ok.csv', index=False)
+job_postings_filtered.to_csv('job_postings_ok.csv', index=False)
+
+print("Step 8 complete: Filtered job_summary and job_postings.")
+
+
+# 009_unificar_datasets.py
+from utils import merge_datasets
+
+skills_df = pd.read_csv('job_skills.csv')
+summary_df = pd.read_csv('job_summary.csv')
+postings_df = pd.read_csv('job_postings.csv')
+
+merged_df = merge_datasets(postings_df, skills_df, on='job_id')
+merged_df = merge_datasets(merged_df, summary_df, on='job_id')
+merged_df = merged_df.sort_values(by='job_id')
+
+merged_df.to_csv('dataset.csv', index=False)
+
+print("Step 9 complete: Unified dataset saved.")
+
+
+# 010_combinar_onet.py
+from utils import combine_onet_skills
+
+abilities_df = pd.read_excel('ONET_Abilities.xlsx', usecols=['Element Name']).rename(columns={'Element Name': 'Skill'})
+skills_df = pd.read_excel('ONET_Skills.xlsx', usecols=['Element Name']).rename(columns={'Element Name': 'Skill'})
+tech_skills_df = pd.read_excel('ONET_Tech_Skills.xlsx', usecols=['Example']).rename(columns={'Example': 'Skill'})
+
+combined_skills_df = combine_onet_skills([abilities_df, skills_df, tech_skills_df])
+combined_skills_df.to_csv('onetlist.csv', index=False, encoding='utf-8')
+
+print("Step 10 complete: Combined ONET skills saved.")
