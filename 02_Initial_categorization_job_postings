@@ -1,0 +1,132 @@
+import pandas as pd
+import numpy as np
+import re
+import unicodedata
+import logging
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.cluster import KMeans, MiniBatchKMeans, SpectralClustering, DBSCAN
+from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
+from sklearn.preprocessing import normalize
+import scipy.sparse as sp
+from scipy.sparse import csr_matrix
+from collections import defaultdict, Counter
+from functools import partial
+import warnings
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Caching configuration
+cachedir = './cache_clustering'
+memory = Memory(cachedir, verbose=0)
+
+# **Step 1: Text Preprocessing (011_preprocess_text.py)**
+def preprocess_text(text):
+    text = text.lower()
+    text = unicodedata.normalize('NFKD', text).encode('ASCII', 'ignore').decode('utf-8')
+    text = re.sub(r'[^a-z0-9\s\+\#\.\-\_]', '', text)
+    text = re.sub(r'\s+', ' ', text)
+    text = text.strip()
+    return text
+
+def apply_preprocessing(df, columns):
+    for column in columns:
+        df[column] = df[column].apply(preprocess_text)
+    return df
+
+# Load dataset and preprocess
+df = pd.read_csv('dataset.csv')
+columns_to_preprocess = ['job_title', 'job_skills']
+df = apply_preprocessing(df, columns_to_preprocess)
+df.to_csv('dataset_preprocessed.csv', index=False)
+logger.info("Step 1: Preprocessed dataset saved as 'dataset_preprocessed.csv'.")
+
+# **Step 2: TF-IDF Vectorization (012_tfidf_job.py)**
+def vectorize_column(df, column_name, max_features=5000):
+    vectorizer = TfidfVectorizer(max_features=max_features, stop_words="english", min_df=0.01, max_df=0.95, norm='l2')
+    tfidf_matrix = vectorizer.fit_transform(df[column_name].dropna().astype(str))
+    feature_names = vectorizer.get_feature_names_out()
+    return tfidf_matrix, feature_names
+
+# Vectorize 'job_title'
+tfidf_matrix, job_title_features = vectorize_column(df, "job_title")
+sp.save_npz("tfidf_job_title.npz", tfidf_matrix)
+pd.DataFrame(job_title_features, columns=["feature"]).to_csv("job_title_features.csv", index=False)
+logger.info("Step 2: TF-IDF matrix saved as 'tfidf_job_title.npz' and features as 'job_title_features.csv'.")
+
+# **Step 3: Model Evaluation with Multiple Clustering Methods (013_evaluate_models_job_title.py)**
+def load_tfidf_matrix(filepath):
+    matrix = sp.load_npz(filepath)
+    return normalize(matrix, norm='l2', axis=1)
+
+def evaluate_model(tfidf_matrix, labels, sample_size=10000):
+    try:
+        n_samples = tfidf_matrix.shape[0]
+        if n_samples > sample_size:
+            indices = np.random.choice(n_samples, sample_size, replace=False)
+            tfidf_sample = tfidf_matrix[indices]
+            labels_sample = labels[indices]
+        else:
+            tfidf_sample, labels_sample = tfidf_matrix, labels
+        silhouette_avg = silhouette_score(tfidf_sample, labels_sample, metric='cosine', sample_size=min(5000, sample_size))
+        davies_bouldin_avg = davies_bouldin_score(tfidf_sample.toarray(), labels_sample)
+        return silhouette_avg, davies_bouldin_avg
+    except Exception as e:
+        logger.error(f"Error calculating metrics: {str(e)}")
+        return None, None
+
+# Evaluate models (K-means, DBSCAN, etc.)
+tfidf_matrix = load_tfidf_matrix("tfidf_job_title.npz")
+kmeans = KMeans(n_clusters=200, random_state=42)
+labels = kmeans.fit_predict(tfidf_matrix)
+silhouette_avg, davies_bouldin_avg = evaluate_model(tfidf_matrix, labels)
+logger.info(f"Step 3: Model Evaluation: Silhouette={silhouette_avg}, Davies-Bouldin={davies_bouldin_avg}")
+
+# **Step 4: KMeans with Additional Evaluation Metrics (014_evaluate_model_kmeans_job_title.py)**
+def cluster_and_evaluate_kmeans(tfidf_matrix, n_clusters):
+    model = MiniBatchKMeans(n_clusters=n_clusters, init='k-means++', batch_size=10000)
+    labels = model.fit_predict(tfidf_matrix)
+    silhouette_avg, davies_bouldin_avg, calinski_harabasz_avg = evaluate_model(tfidf_matrix, labels)
+    return labels, silhouette_avg, davies_bouldin_avg, calinski_harabasz_avg
+
+# Evaluate KMeans
+labels, silhouette_avg, davies_bouldin_avg, calinski_harabasz_avg = cluster_and_evaluate_kmeans(tfidf_matrix, 200)
+logger.info(f"Step 4: KMeans evaluation metrics: Silhouette={silhouette_avg}, Davies-Bouldin={davies_bouldin_avg}, Calinski-Harabasz={calinski_harabasz_avg}")
+
+# **Step 5: Cluster Aggregation (015_group_job_titles.py)**
+job_titles = df['job_title']
+clusters = labels
+
+def cluster_name(terms, threshold=0.8):
+    word_counter = Counter(word for term in terms for word in term.split())
+    min_appearances = int(len(terms) * threshold)
+    common_words = [word for word, count in word_counter.items() if count >= min_appearances]
+    return " ".join([word for word in terms[0].split() if word in common_words]) if common_words else "unknown"
+
+# Aggregations based on clusters
+df_aggregated = pd.DataFrame({'titles': job_titles, 'Cluster': clusters})
+df_aggregated['Cluster'] = df_aggregated['Cluster'].fillna("unknown")
+df_aggregated.to_csv("job_clusters_kmeans.csv", index=False)
+logger.info("Step 5: Aggregated clusters saved as 'job_clusters_kmeans.csv'.")
+
+# **Step 6: Simplified Grouping (017_simplify_job_clusters.py)**
+# Define cluster simplifications and apply them
+cluster_groups = {"account executive": ["account executive", "account manager"], "engineer": ["engineer", "technician"]}
+# Simplified grouping function, similar to above
+df_grouped = pd.DataFrame([(category, ', '.join(titles)) for category, titles in cluster_groups.items()], columns=["Cluster", "titles"])
+df_grouped.to_csv("job_clusters_grouped.csv", index=False)
+logger.info("Step 6: Simplified clusters saved as 'job_clusters_grouped.csv'.")
+
+# **Step 7: Assign Job Categories (018_categorize_job_titles.py)**
+clusters = pd.read_csv("job_clusters_grouped.csv")
+cluster_mapping = {}
+for _, row in clusters.iterrows():
+    job_titles = row['titles'].split(', ')
+    for title in job_titles:
+        cluster_mapping[title.strip().lower()] = row['Cluster']
+
+# Map each job_title to a category
+df['job_category'] = df['job_title'].apply(lambda title: cluster_mapping.get(title.lower(), "Unknown"))
+df.to_csv("dataset_categorized.csv", index=False)
+logger.info("Step 7: Categorized dataset saved as 'dataset_categorized.csv'.")
