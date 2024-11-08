@@ -1,0 +1,219 @@
+# Import necessary libraries
+import pandas as pd
+import re
+from collections import Counter
+from tqdm import tqdm
+from datetime import datetime
+from difflib import SequenceMatcher
+from nltk.metrics.distance import edit_distance
+import numpy as np
+
+# -------------------------------------------------------------------------------------
+# Code from '019_filter_skills_by_onet.py': Filter ONET Skills in the Dataset
+# -------------------------------------------------------------------------------------
+
+def clean_skills(skills_str):
+    """Clean and split skills string into a list"""
+    if pd.isna(skills_str):
+        return []
+    # Convert to lowercase and split by spaces
+    skills = skills_str.lower().split()
+    return skills
+
+def calculate_skill_frequency(df, skill_column):
+    """Calculate frequency of each skill in the dataset"""
+    total_records = len(df)
+    all_skills = []
+    skill_counts = Counter()
+    for skills in tqdm(df[skill_column].dropna(), desc="Calculating skill frequencies"):
+        skills_list = skills.lower().split()
+        skill_counts.update(skills_list)
+        all_skills.extend(skills_list)
+    skill_frequencies = {
+        skill: {
+            'count': count,
+            'percentage': (count / total_records) * 100
+        }
+        for skill, count in skill_counts.items()
+    }
+    return skill_frequencies
+
+def save_analysis_to_file(analysis_text, filename):
+    """Save analysis results to a file"""
+    with open(filename, 'w', encoding='utf-8') as f:
+        f.write(analysis_text)
+
+print("Starting skills analysis...")
+
+# Read the input files
+onet_skills = pd.read_csv('onet_list.csv')
+dataset = pd.read_csv('filtered_dataset.csv')
+
+onet_skills_list = [skill.lower() for skill in onet_skills['skill'].tolist()]
+dataset['onet_skills'] = ''
+
+# Process each row to match ONET skills
+for idx in tqdm(range(len(dataset)), desc="Processing records"):
+    row = dataset.iloc[idx]
+    if pd.isna(row['job_skills']):
+        continue
+    job_skills = row['job_skills'].lower()
+    onet_matches = []
+    remaining_skills = job_skills
+    for onet_skill in onet_skills_list:
+        if onet_skill in job_skills:
+            onet_matches.append(onet_skill)
+            remaining_skills = remaining_skills.replace(onet_skill, '')
+    dataset.at[idx, 'onet_skills'] = ' '.join(onet_matches) if onet_matches else ''
+    dataset.at[idx, 'job_skills'] = remaining_skills.strip()
+
+dataset = dataset[['job_id', 'job_category', 'job_title', 'job_level', 
+                  'onet_skills', 'job_skills', 'job_summary']]
+dataset = dataset.sort_values('job_id')
+
+dataset.to_csv('dataset_with_onet_column.csv', index=False)
+
+# -------------------------------------------------------------------------------------
+# Code from '020_correct_skills.py': Correct Skills in Dataset
+# -------------------------------------------------------------------------------------
+
+def calculate_similarity_ratio(str1, str2):
+    """Calculate similarity ratio between two strings"""
+    return SequenceMatcher(None, str1, str2).ratio()
+
+def calculate_normalized_levenshtein(str1, str2):
+    """Calculate normalized Levenshtein distance between two strings"""
+    distance = edit_distance(str1, str2)
+    max_len = max(len(str1), len(str2))
+    if max_len == 0:
+        return 0
+    return 1 - (distance / max_len)
+
+def find_similar_onet_skill(skill, onet_skills_list, threshold=0.85):
+    """Find the most similar ONET skill above threshold"""
+    best_match, best_score = None, 0
+    for onet_skill in onet_skills_list:
+        sequence_ratio = calculate_similarity_ratio(skill, onet_skill)
+        levenshtein_ratio = calculate_normalized_levenshtein(skill, onet_skill)
+        combined_score = (sequence_ratio + levenshtein_ratio) / 2
+        if combined_score > best_score and combined_score >= threshold:
+            best_score = combined_score
+            best_match = onet_skill
+    return best_match, best_score
+
+print("Starting skills similarity analysis...")
+
+onet_skills = pd.read_csv('onet_list.csv')
+dataset = pd.read_csv('dataset_with_onet_column.csv')
+
+onet_skills_list = [skill.lower() for skill in onet_skills['skill'].tolist()]
+initial_job_skills_freq = calculate_skill_frequency(dataset, 'job_skills')
+
+similarity_results = [
+    {'job_skill': skill, 'frequency': stats['percentage'], 'count': stats['count'],
+     'similar_onet_skill': find_similar_onet_skill(skill, onet_skills_list, 0.9)[0]}
+    for skill, stats in initial_job_skills_freq.items() if stats['percentage'] >= 5
+]
+
+dataset, _, _ = correct_skills_in_dataset(dataset, similarity_results, similarity_threshold=0.9)
+dataset.to_csv('dataset_with_onet_column_corrected.csv', index=False)
+
+# -------------------------------------------------------------------------------------
+# Code from '021_refilter_skills_by_onet.py': Re-filter ONET Skills in Corrected Dataset
+# -------------------------------------------------------------------------------------
+
+print("Starting re-filtering ONET skills...")
+
+onet_skills = pd.read_csv('onet_list.csv')
+dataset = pd.read_csv('dataset_with_onet_column_corrected.csv')
+onet_skills_list = [skill.lower() for skill in onet_skills['skill'].tolist()]
+
+for idx in tqdm(range(len(dataset)), desc="Processing records"):
+    row = dataset.iloc[idx]
+    if pd.isna(row['job_skills']):
+        continue
+    job_skills = row['job_skills'].lower()
+    onet_matches = [onet_skill for onet_skill in onet_skills_list if onet_skill in job_skills]
+    existing_skills = set(str(row['onet_skills']).lower().split()) if not pd.isna(row['onet_skills']) else set()
+    new_skills = set(onet_matches)
+    all_skills = existing_skills.union(new_skills)
+    if new_skills:
+        dataset.at[idx, 'onet_skills'] = ' '.join(all_skills)
+
+dataset = dataset[['job_id', 'job_category', 'job_title', 'job_level', 'onet_skills', 'job_skills', 'job_summary']]
+dataset = dataset.sort_values('job_id')
+dataset.to_csv('final_dataset.csv', index=False)
+
+# -------------------------------------------------------------------------------------
+# Code from '022_remove_r_j_c_go.py': Remove "r", "c", "j", "go" from ONET Skills Column
+# -------------------------------------------------------------------------------------
+
+print("Removing specific skills 'r', 'c', 'j', 'go'...")
+
+df = pd.read_csv("final_dataset.csv")
+
+def remove_specific_skills(onet_skills, skills_to_remove):
+    for skill in skills_to_remove:
+        onet_skills = re.sub(rf"\b{skill}\b", "", onet_skills)
+    return " ".join(onet_skills.split())
+
+skills_to_remove = ["r", "c", "j", "go"]
+df["onet_skills"] = df["onet_skills"].apply(lambda x: remove_specific_skills(str(x), skills_to_remove))
+df.to_csv("final_dataset.csv", index=False)
+
+# -------------------------------------------------------------------------------------
+# Code from '023_analyze_onet_skills.py': Analyze ONET Skills
+# -------------------------------------------------------------------------------------
+
+print("Analyzing ONET skills...")
+
+df = pd.read_csv("final_dataset.csv")
+
+def analyze_skills(column):
+    skills_list = [skill.strip() for skills in column.dropna() for skill in skills.split()]
+    skills_counter = Counter(skills_list)
+    skill_records = {skill: sum([1 for skills in column.dropna() if skill in skills.split()]) for skill in skills_counter}
+    skills_count_per_record = column.dropna().apply(lambda x: len(x.split()))
+    stats = {
+        'min': skills_count_per_record.min(),
+        'mean': skills_count_per_record.mean(),
+        'max': skills_count_per_record.max()
+    }
+    df_analysis = pd.DataFrame({
+        'Skill': skills_counter.keys(),
+        'Frequency': skills_counter.values(),
+        'Record Count': skill_records.values(),
+        'Frequency (%)': [round((count / len(df)) * 100, 2) for count in skills_counter.values()]
+    })
+    df_analysis = df_analysis.sort_values(by="Skill").reset_index(drop=True)
+    df_analysis.to_csv("onet_skills_analysis.csv", index=False)
+
+    print(f"Min skills per record: {stats['min']}")
+    print(f"Mean skills per record: {stats['mean']:.2f}")
+    print(f"Max skills per record: {stats['max']}")
+    print("Top 10 most frequent skills:\n", df_analysis.nlargest(10, 'Frequency'))
+    print("Top 10 least frequent skills:\n", df_analysis.nsmallest(10, 'Frequency'))
+    print("ONET skills analysis saved in 'onet_skills_analysis.csv'.")
+
+analyze_skills(df["onet_skills"])
+
+# -------------------------------------------------------------------------------------
+# Code from '024_remove_duplicates_and_nulls.py': Remove Duplicates and Nulls from Dataset
+# -------------------------------------------------------------------------------------
+
+print("Removing duplicates and nulls...")
+
+df = pd.read_csv('final_dataset.csv')
+print("Null values by column before cleaning:")
+print(df.isnull().sum())
+df = df.dropna()
+duplicated_rows = df.duplicated(subset='job_id')
+print(f"Duplicate rows found: {duplicated_rows.sum()}")
+df = df.drop_duplicates(subset='job_id')
+
+if 'job_skills' in df.columns:
+    df = df.drop(columns=['job_skills'])
+    print("Column 'job_skills' deleted.")
+
+df.to_csv('cleaned_dataset.csv', index=False)
+print("Dataset cleaned, duplicates and nulls removed, and 'job_skills' column deleted.")
