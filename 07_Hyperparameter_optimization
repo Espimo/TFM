@@ -1,0 +1,184 @@
+import pandas as pd
+import numpy as np
+import tensorflow as tf
+from transformers import DistilBertTokenizerFast, TFDistilBertForSequenceClassification
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import hamming_loss, accuracy_score, f1_score
+import os
+import json
+from datetime import datetime
+from itertools import product
+
+# Hyperparameter configurations to test
+param_grid = {
+    'learning_rate': [2e-5, 3e-5],
+    'batch_size': [8],
+    'epochs': [5, 10],
+    'max_length': [128],
+    'min_samples_per_class': [5, 10]
+}
+
+output_dir = 'hyperparameter_optimization'
+os.makedirs(output_dir, exist_ok=True)
+log_file = os.path.join(output_dir, 'optimization_log.txt')
+
+def log_message(message):
+    """Logs a message to both the console and a file."""
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    log_entry = f"[{timestamp}] {message}"
+    print(log_entry)
+    with open(log_file, 'a', encoding='utf-8') as f:
+        f.write(log_entry + '\n')
+
+# GPU configuration
+tf.config.set_soft_device_placement(True)
+physical_devices = tf.config.list_physical_devices('GPU')
+if physical_devices:
+    try:
+        for device in physical_devices:
+            tf.config.experimental.set_memory_growth(device, True)
+        log_message("GPU configured for dynamic memory growth")
+    except RuntimeError as e:
+        log_message(f"Error configuring GPU: {e}")
+else:
+    log_message("No GPUs detected. Evaluation will proceed on CPU")
+
+def prepare_dataset(min_samples_per_class=5, sample_fraction=0.15):
+    """
+    Prepares the dataset by applying filters and creating a stratified sample once.
+    """
+    log_message("Starting data loading and preprocessing...")
+    
+    # Load data
+    df = pd.read_csv('preprocessed_skills_list.csv', usecols=['job_summary'])
+    df = df.dropna(subset=['job_summary'])
+    texts = df['job_summary'].astype(str).tolist()
+    labels_df = pd.read_csv('dataset_skills_binarized.csv', dtype=np.int8)
+    
+    # First filter: remove classes with very few examples
+    class_counts = labels_df.sum()
+    valid_columns = class_counts[class_counts >= min_samples_per_class].index
+    labels_df = labels_df[valid_columns]
+    labels = labels_df.values
+    
+    log_message(f"Initial classes: {len(class_counts)}, Classes after filtering: {len(valid_columns)}")
+    
+    # Create initial sample
+    sample_size = int(len(texts) * sample_fraction)
+    texts_sample, _, labels_sample, _ = train_test_split(
+        texts,
+        labels,
+        train_size=sample_size,
+        random_state=42
+    )
+    
+    # Second filter: ensure all classes in the sample have at least 2 examples
+    sample_class_counts = labels_sample.sum(axis=0)
+    valid_sample_columns = [i for i, count in enumerate(sample_class_counts) if count >= 2]
+    
+    if not valid_sample_columns:
+        raise ValueError("Not enough examples per class in the sample")
+    
+    labels_sample = labels_sample[:, valid_sample_columns]
+    label_list = [valid_columns[i] for i in valid_sample_columns]
+    
+    log_message(f"Sample created with {len(texts_sample)} examples")
+    log_message(f"Classes in the final sample: {len(label_list)}")
+    
+    return texts_sample, labels_sample, label_list
+
+def create_tf_dataset(texts, labels, tokenizer, max_length, batch_size):
+    encodings = tokenizer(
+        texts,
+        truncation=True,
+        padding='max_length',
+        max_length=max_length,
+        return_tensors='tf'
+    )
+    dataset = tf.data.Dataset.from_tensor_slices((dict(encodings), labels))
+    dataset = dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    return dataset
+
+def compute_metrics(y_true, y_pred):
+    metrics = {
+        'hamming_loss': hamming_loss(y_true, y_pred),
+        'exact_match_ratio': accuracy_score(y_true, y_pred),
+        'f1_score_micro': f1_score(y_true, y_pred, average='micro', zero_division=0),
+        'f1_score_macro': f1_score(y_true, y_pred, average='macro', zero_division=0)
+    }
+    return metrics
+
+def optimize_hyperparameters():
+    # Prepare dataset once before running combinations
+    try:
+        texts_sample, labels_sample, label_list = prepare_dataset(min_samples_per_class=5, sample_fraction=0.15)
+    except Exception as e:
+        log_message(f"Error in dataset preparation: {e}")
+        return
+    
+    param_combinations = list(product(*param_grid.values()))
+    log_message(f"Total hyperparameter combinations: {len(param_combinations)}")
+    
+    best_metrics = None
+    best_params = None
+    
+    for i, param_values in enumerate(param_combinations):
+        params = dict(zip(param_grid.keys(), param_values))
+        log_message(f"\n--- Combination {i + 1}/{len(param_combinations)} ---")
+        log_message(f"Hyperparameters: {params}")
+        
+        # Initialize tokenizer and model
+        tokenizer = DistilBertTokenizerFast.from_pretrained('distilbert-base-uncased')
+        model = TFDistilBertForSequenceClassification.from_pretrained(
+            'distilbert-base-uncased',
+            num_labels=len(label_list)
+        )
+        
+        # Create datasets
+        train_dataset = create_tf_dataset(texts_sample, labels_sample, tokenizer, 
+                                          params['max_length'], params['batch_size'])
+        val_dataset = create_tf_dataset(texts_sample, labels_sample, tokenizer, 
+                                        params['max_length'], params['batch_size'])
+        
+        # Configure optimizer
+        optimizer = tf.keras.optimizers.Adam(learning_rate=params['learning_rate'])
+        model.compile(optimizer=optimizer, 
+                      loss=tf.keras.losses.BinaryCrossentropy(from_logits=True), 
+                      metrics=['accuracy'])
+        
+        # Training
+        log_message("Starting training...")
+        history = model.fit(train_dataset, validation_data=val_dataset, 
+                            epochs=params['epochs'], verbose=1)
+        
+        # Evaluation
+        log_message("Evaluating model...")
+        y_pred_logits = model.predict(val_dataset).logits
+        y_pred = tf.sigmoid(y_pred_logits).numpy()
+        y_pred = (y_pred >= 0.5).astype(int)
+        metrics_results = compute_metrics(labels_sample, y_pred)
+        
+        # Update best model if applicable
+        if best_metrics is None or metrics_results['f1_score_micro'] > best_metrics['f1_score_micro']:
+            best_metrics = metrics_results
+            best_params = params
+            model.save_pretrained(os.path.join(output_dir, 'best_model'))
+            tokenizer.save_pretrained(os.path.join(output_dir, 'best_model'))
+            log_message("New best model saved.")
+        
+        log_message(f"Metrics for this combination: {metrics_results}")
+    
+    # Save final results
+    if best_params is not None:
+        log_message("\nBest Hyperparameters:")
+        log_message(str(best_params))
+        with open(f'{output_dir}/best_hyperparameters.json', 'w') as f:
+            json.dump(best_params, f)
+        with open(f'{output_dir}/best_metrics.json', 'w') as f:
+            json.dump(best_metrics, f)
+        log_message(f"Optimization completed. Best hyperparameters saved in '{output_dir}'.")
+    else:
+        log_message("Optimization could not be completed due to errors.")
+
+if __name__ == "__main__":
+    optimize_hyperparameters()
