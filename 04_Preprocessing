@@ -1,0 +1,241 @@
+# Import necessary libraries
+import pandas as pd
+import re
+import nltk
+from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize
+from nltk.stem import WordNetLemmatizer
+from sklearn.feature_extraction.text import CountVectorizer
+from tqdm import tqdm
+import multiprocessing as mp
+from functools import partial
+import logging
+import time
+import numpy as np
+from collections import Counter
+import ast
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# -------------------------------------------------------------------------------------
+# Code from '025_preprocessing.py': Text Preprocessing
+# -------------------------------------------------------------------------------------
+
+class TextPreprocessor:
+    def __init__(self, language='english'):
+        """Initialize the text preprocessor with required NLTK resources."""
+        self.language = language
+        self._initialize_nltk_resources()
+        self.stop_words = set(stopwords.words(language))
+        self.lemmatizer = WordNetLemmatizer()
+        
+    def _initialize_nltk_resources(self):
+        """Download required NLTK resources if not already present."""
+        resources = ['punkt', 'stopwords', 'wordnet']
+        for resource in resources:
+            try:
+                nltk.data.find(f'tokenizers/{resource}')
+            except LookupError:
+                logger.info(f"Downloading {resource}...")
+                nltk.download(resource, quiet=True)
+
+    def preprocess_text(self, text):
+        """Preprocess a single text string."""
+        if pd.isna(text):
+            return ""
+            
+        # Convert to lowercase and remove special characters
+        text = str(text).lower()
+        text = re.sub(r'[^a-zA-Z\s]', '', text)
+        
+        # Tokenization and stop-word removal
+        tokens = word_tokenize(text)
+        tokens = [word for word in tokens if word not in self.stop_words]
+        
+        # Lemmatization
+        tokens = [self.lemmatizer.lemmatize(word) for word in tokens]
+        
+        return ' '.join(tokens)
+
+    def process_dataframe(self, df, text_columns):
+        """Process multiple text columns in a DataFrame with progress bar."""
+        start_time = time.time()
+        logger.info("Starting text preprocessing...")
+        
+        # Create a copy to avoid modifying the original DataFrame
+        df_processed = df.copy()
+        
+        for column in text_columns:
+            if column not in df.columns:
+                logger.warning(f"Column {column} not found in DataFrame")
+                continue
+                
+            logger.info(f"Processing column: {column}")
+            tqdm.pandas(desc=f"Processing {column}")
+            df_processed[column] = df_processed[column].progress_apply(self.preprocess_text)
+        
+        elapsed_time = time.time() - start_time
+        logger.info(f"Preprocessing completed in {elapsed_time:.2f} seconds")
+        
+        return df_processed
+
+    def create_ngrams(self, texts, ngram_range=(1, 3), min_df=2):
+        """Create n-grams from processed texts."""
+        logger.info(f"Generating n-grams with range {ngram_range}...")
+        
+        vectorizer = CountVectorizer(
+            ngram_range=ngram_range,
+            min_df=min_df
+        )
+        
+        ngrams_matrix = vectorizer.fit_transform(texts)
+        ngrams_df = pd.DataFrame(
+            ngrams_matrix.toarray(),
+            columns=vectorizer.get_feature_names_out()
+        )
+        
+        return ngrams_df, vectorizer
+
+try:
+    # Initialize the preprocessor
+    preprocessor = TextPreprocessor()
+    
+    # Load the dataset
+    logger.info("Loading dataset...")
+    df = pd.read_csv('dataset.csv')
+    
+    # Columns to process
+    text_columns = ['onet_skills', 'job_summary', 'job_category']
+    
+    # Process text
+    df_processed = preprocessor.process_dataframe(df, text_columns)
+    
+    # Generate n-grams for onet_skills
+    ngrams_df, vectorizer = preprocessor.create_ngrams(
+        df_processed['onet_skills'],
+        ngram_range=(1, 3),
+        min_df=2
+    )
+    
+    # Save results
+    logger.info("Saving results...")
+    df_processed.to_csv('preprocessed_dataset.csv', index=False)
+    ngrams_df.to_csv('ngrams.csv', index=False)
+    
+    logger.info("Processing completed successfully!")
+    
+except Exception as e:
+    logger.error(f"Error during processing: {str(e)}")
+    raise
+
+# -------------------------------------------------------------------------------------
+# Code from '026_list_skills.py': Listing Skills from Processed Data
+# -------------------------------------------------------------------------------------
+
+def process_skills(df):
+    """Process the skills column by handling null values and converting strings to lists."""
+    def split_skills(x):
+        if isinstance(x, str):
+            return x.split()
+        return []
+    
+    df_processed = df.copy()
+    
+    # Replace null values with an empty list
+    df_processed['onet_skills'] = df_processed['onet_skills'].fillna('')
+    
+    # Apply the split function
+    df_processed['onet_skills'] = df_processed['onet_skills'].apply(split_skills)
+    
+    return df_processed
+
+# Load the dataset
+df = pd.read_csv('preprocessed_dataset.csv')
+
+# Process skills
+df_processed = process_skills(df)
+
+print("\nSample of processed rows:")
+print(df_processed[['job_id', 'onet_skills']].head())
+
+# Save the result
+df_processed.to_csv('preprocessed_skills_list.csv', index=False)
+print("\nFile saved successfully as 'preprocessed_skills_list.csv'")
+
+# -------------------------------------------------------------------------------------
+# Code from '027_skill_frequency_analysis_balancing.py': Skill Frequency Analysis
+# -------------------------------------------------------------------------------------
+
+# Load dataset with skills from 'onet_skills' column
+df = pd.read_csv('preprocessed_skills_list.csv', usecols=['onet_skills'])
+
+# Ensure skills are in a list format and count the frequency of each skill
+skill_counts = Counter()
+for skills in df['onet_skills'].dropna():
+    skill_list = skills.strip('[]').replace("'", "").split(', ')
+    skill_counts.update(skill_list)
+
+# Convert the counter to a DataFrame ordered by frequency
+skill_frequencies_df = pd.DataFrame(skill_counts.items(), columns=['Skill', 'Frequency']).sort_values(by='Frequency', ascending=False)
+
+# Save the skill list with frequencies to a text file
+output_file = 'skill_frequencies.txt'
+with open(output_file, 'w') as f:
+    for skill, freq in skill_frequencies_df.values:
+        f.write(f"{skill}: {freq}\n")
+
+print(f"List of skills with frequencies saved in '{output_file}'.")
+
+# Show the first few rows of the file for quick review
+print(skill_frequencies_df.head())
+
+# -------------------------------------------------------------------------------------
+# Code from '028_balance_skills_dataset_before_feature_selection.py': Balancing Skills
+# -------------------------------------------------------------------------------------
+
+# Load the dataset
+df = pd.read_csv('preprocessed_skills_list.csv')
+
+# Convert skills from string to Python list
+df['onet_skills'] = df['onet_skills'].apply(ast.literal_eval)
+
+# Count the frequency of each skill in the dataset
+all_skills = df['onet_skills'].explode()
+skill_counts = all_skills.value_counts()
+
+# Filter skills that appear at least 100 times
+skills_to_keep = skill_counts[skill_counts >= 100].index
+
+# Filter the DataFrame to remove skills with fewer than 100 occurrences
+df['onet_skills'] = df['onet_skills'].apply(lambda skills: [skill for skill in skills if skill in skills_to_keep])
+
+# Remove rows with empty skill lists after filtering
+df = df[df['onet_skills'].apply(len) > 0]
+
+# Drop unwanted columns
+df.drop(columns=['job_category', 'job_level'], inplace=True)
+
+# Save the new filtered dataset
+df.to_csv('balanced_dataset.csv', index=False)
+
+print("Process completed. The filtered dataset has been saved as 'balanced_dataset.csv'.")
+
+# -------------------------------------------------------------------------------------
+# Code from '029_remove_duplicate_skills.py': Removing Duplicate Skills
+# -------------------------------------------------------------------------------------
+
+# Load the filtered dataset
+df = pd.read_csv("balanced_dataset.csv")
+
+# Remove duplicates within each record's skill list
+df['onet_skills'] = df['onet_skills'].apply(lambda x: list(set(eval(x))))
+
+# Save the updated dataset
+df.to_csv("balanced_dataset.csv", index=False)
+
+print("Duplicate skills removed within each record.")
