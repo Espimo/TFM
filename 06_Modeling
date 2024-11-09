@@ -1,0 +1,247 @@
+import pandas as pd
+import numpy as np
+import tensorflow as tf
+from transformers import DistilBertTokenizerFast, TFDistilBertForSequenceClassification
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import hamming_loss, accuracy_score, f1_score
+import os
+import json
+from datetime import datetime
+
+# Initial configuration
+batch_size = 16
+epochs = 5
+learning_rate = 1e-5
+max_length = 128
+weight_decay = 0.01
+output_dir = 'job_classification_model'
+checkpoint_dir = os.path.join(output_dir, 'checkpoints')
+os.makedirs(checkpoint_dir, exist_ok=True)
+
+# Logging configuration
+log_file = os.path.join(output_dir, 'training_and_evaluation_log.txt')
+os.makedirs(output_dir, exist_ok=True)
+
+def log_message(message):
+    """Logs a message to both the console and a file."""
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    log_entry = f"[{timestamp}] {message}"
+    print(log_entry)
+    with open(log_file, 'a', encoding='utf-8') as f:
+        f.write(log_entry + '\n')
+
+# GPU configuration
+tf.config.set_soft_device_placement(True)
+physical_devices = tf.config.list_physical_devices('GPU')
+if physical_devices:
+    try:
+        for device in physical_devices:
+            tf.config.experimental.set_memory_growth(device, True)
+        log_message("GPU configured for dynamic memory growth")
+    except RuntimeError as e:
+        log_message(f"Error configuring GPU: {e}")
+else:
+    log_message("No GPUs detected. Training will proceed on CPU")
+
+def load_and_preprocess_data(min_samples_per_class=2):
+    log_message("Starting data loading and preprocessing...")
+
+    df = pd.read_csv('preprocessed_skills_list.csv', usecols=['job_summary'])
+    initial_samples = len(df)
+    df = df.dropna(subset=['job_summary'])
+    texts = df['job_summary'].astype(str).tolist()
+
+    log_message(f"Loaded texts: {initial_samples} initial samples, {len(texts)} after removing nulls")
+
+    labels_df = pd.read_csv('dataset_skills_binarized.csv', dtype=np.int8)
+    initial_classes = len(labels_df.columns)
+
+    class_counts = labels_df.sum()
+    valid_columns = class_counts[class_counts >= min_samples_per_class].index
+    labels_df = labels_df[valid_columns]
+    labels = labels_df.values
+
+    assert len(texts) == labels.shape[0], "Mismatch in data dimensions"
+
+    try:
+        texts_train, texts_test, y_train, y_test = train_test_split(
+            texts,
+            labels,
+            test_size=0.2,
+            random_state=42,
+            stratify=labels_df.sum(axis=1)
+        )
+        log_message("Stratified split successful")
+    except ValueError as e:
+        log_message(f"Error in stratified split: {e}")
+        texts_train, texts_test, y_train, y_test = train_test_split(
+            texts,
+            labels,
+            test_size=0.2,
+            random_state=42
+        )
+
+    log_message(f"Data split completed:")
+    log_message(f"- Training samples: {len(texts_train)}")
+    log_message(f"- Test samples: {len(texts_test)}")
+
+    return texts_train, texts_test, y_train, y_test, valid_columns.tolist()
+
+def create_tf_dataset(texts, labels, tokenizer, is_training=True):
+    encodings = tokenizer(
+        texts,
+        truncation=True,
+        padding='max_length',
+        max_length=max_length,
+        return_tensors='tf'
+    )
+
+    dataset = tf.data.Dataset.from_tensor_slices((dict(encodings), labels))
+
+    if is_training:
+        dataset = dataset.shuffle(10000, reshuffle_each_iteration=True)
+
+    dataset = dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    return dataset
+
+def compute_metrics(y_true, y_pred):
+    metrics = {
+        'hamming_loss': hamming_loss(y_true, y_pred),
+        'exact_match_ratio': accuracy_score(y_true, y_pred),
+        'f1_score_micro': f1_score(y_true, y_pred, average='micro', zero_division=0),
+        'f1_score_macro': f1_score(y_true, y_pred, average='macro', zero_division=0)
+    }
+    return metrics
+
+def train_and_evaluate():
+    log_message("Starting training process...")
+
+    texts_train, texts_test, y_train, y_test, label_list = load_and_preprocess_data(min_samples_per_class=2)
+    num_labels = len(label_list)
+
+    log_message(f"Model configuration:")
+    log_message(f"- Number of labels: {num_labels}")
+    log_message(f"- Batch size: {batch_size}")
+    log_message(f"- Epochs: {epochs}")
+    log_message(f"- Learning rate: {learning_rate}")
+    log_message(f"- Weight decay: {weight_decay}")
+
+    tokenizer = DistilBertTokenizerFast.from_pretrained('distilbert-base-uncased')
+    model = TFDistilBertForSequenceClassification.from_pretrained(
+        'distilbert-base-uncased',
+        num_labels=num_labels,
+        problem_type="multi_label_classification"
+    )
+
+    optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+    loss_fn = tf.keras.losses.BinaryCrossentropy(from_logits=True)
+    metrics = [tf.keras.metrics.BinaryAccuracy(name='accuracy')]
+
+    model.compile(
+        optimizer=optimizer,
+        loss=loss_fn,
+        metrics=metrics
+    )
+
+    log_message("Creating training and test datasets...")
+    train_dataset = create_tf_dataset(texts_train, y_train, tokenizer, is_training=True)
+    test_dataset = create_tf_dataset(texts_test, y_test, tokenizer, is_training=False)
+
+    callbacks = [
+        tf.keras.callbacks.EarlyStopping(
+            monitor='val_loss',
+            patience=2,
+            restore_best_weights=True
+        ),
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.2,
+            patience=1,
+            verbose=1
+        ),
+        tf.keras.callbacks.ModelCheckpoint(
+            filepath=os.path.join(checkpoint_dir, 'ckpt_{epoch}'),
+            save_weights_only=True,
+            verbose=1
+        )
+    ]
+
+    log_message("Starting training...")
+    history = model.fit(
+        train_dataset,
+        validation_data=test_dataset,
+        epochs=epochs,
+        callbacks=callbacks
+    )
+
+    model.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
+    log_message("Model and tokenizer saved")
+
+    log_message("Evaluating model on test data...")
+    y_pred_logits = model.predict(test_dataset).logits
+    y_pred = tf.sigmoid(y_pred_logits).numpy()
+    y_pred = (y_pred >= 0.5).astype(int)
+
+    metrics_results = compute_metrics(y_test, y_pred)
+
+    with open(f'{output_dir}/model_metrics.json', 'w') as f:
+        json.dump(metrics_results, f)
+
+    with open(f'{output_dir}/training_history.json', 'w') as f:
+        json.dump(history.history, f)
+
+    log_message("Evaluation metrics:")
+    for metric, value in metrics_results.items():
+        log_message(f"- {metric}: {value:.4f}")
+
+    with open(f'{output_dir}/label_list.json', 'w') as f:
+        json.dump(label_list, f)
+
+    log_message(f"Model and results saved in '{output_dir}'")
+
+    example_text = "Looking for a web developer with experience in JavaScript and modern frameworks."
+    log_message("Performing example prediction...")
+    inputs = tokenizer(
+        example_text,
+        truncation=True,
+        padding='max_length',
+        max_length=max_length,
+        return_tensors='tf'
+    )
+    logits = model(inputs).logits
+    predictions = tf.sigmoid(logits).numpy()[0]
+    predicted_labels = [label_list[i] for i, pred in enumerate(predictions) if pred >= 0.5]
+
+    log_message(f"Example text: {example_text}")
+    log_message(f"Predicted labels: {predicted_labels}")
+
+def main():
+    if not os.path.exists(os.path.join(output_dir, 'tf_model.h5')):
+        train_and_evaluate()
+    else:
+        log_message("Trained model found, skipping training and proceeding to evaluation.")
+
+        # Load and evaluate the saved model
+        tokenizer = DistilBertTokenizerFast.from_pretrained(output_dir)
+        model = TFDistilBertForSequenceClassification.from_pretrained(output_dir)
+        
+        texts_test, y_test, label_list = load_and_preprocess_data(min_samples_per_class=2)
+        test_dataset = create_tf_dataset(texts_test, y_test, tokenizer)
+        
+        log_message("Evaluating model on test data...")
+        y_pred_logits = model.predict(test_dataset).logits
+        y_pred = tf.sigmoid(y_pred_logits).numpy()
+        y_pred = (y_pred >= 0.5).astype(int)
+
+        metrics_results = compute_metrics(y_test, y_pred)
+        
+        with open(f'{output_dir}/evaluation_metrics.json', 'w') as f:
+            json.dump(metrics_results, f)
+
+        log_message("Evaluation metrics:")
+        for metric, value in metrics_results.items():
+            log_message(f"- {metric}: {value:.4f}")
+
+if __name__ == "__main__":
+    main()
