@@ -7,18 +7,10 @@ import torch
 from tqdm import tqdm
 from pathlib import Path
 import logging
-from typing import List, Union, Dict
 import gc
 
 class JobSkillsProcessor:
     def __init__(self, model_name: str = 'bert-base-uncased', max_features: int = 10000):
-        """
-        Initializes the job skills processor.
-        
-        Args:
-            model_name: Name of the BERT model to use
-            max_features: Maximum number of features for TF-IDF
-        """
         self.setup_logging()
         self.max_features = max_features
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -26,13 +18,10 @@ class JobSkillsProcessor:
         
         self.setup_bert(model_name)
         self.mlb = MultiLabelBinarizer()
-        self.tfidf_vectorizer = TfidfVectorizer(
-            max_features=max_features, 
-            stop_words='english'
-        )
+        self.tfidf_vectorizer_skills = TfidfVectorizer(max_features=max_features, stop_words='english')
+        self.tfidf_vectorizer_summary = TfidfVectorizer(max_features=max_features, stop_words='english')
 
     def setup_logging(self):
-        """Sets up logging system."""
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(logging.INFO)
         handler = logging.StreamHandler()
@@ -41,21 +30,18 @@ class JobSkillsProcessor:
         self.logger.addHandler(handler)
 
     def setup_bert(self, model_name: str):
-        """Sets up the BERT model and tokenizer."""
         self.logger.info(f"Loading BERT model: {model_name}")
         self.tokenizer = BertTokenizer.from_pretrained(model_name)
         self.bert_model = BertModel.from_pretrained(model_name)
         self.bert_model.to(self.device)
-        self.bert_model.eval()  # Put the model in evaluation mode
+        self.bert_model.eval()
 
     @staticmethod
     def ensure_output_dir(output_dir: str = 'outputs'):
-        """Ensures the output directory exists."""
         Path(output_dir).mkdir(parents=True, exist_ok=True)
         return output_dir
 
     def process_skills_binarization(self, df: pd.DataFrame, output_dir: str) -> pd.DataFrame:
-        """Processes skills binarization."""
         self.logger.info("Binarizing skills...")
         skills_binarized = self.mlb.fit_transform(df['onet_skills'])
         skills_df = pd.DataFrame(skills_binarized, columns=self.mlb.classes_)
@@ -66,27 +52,29 @@ class JobSkillsProcessor:
         self.logger.info(f"Binarization saved at: {output_path}")
         return skills_df
 
-    def process_tfidf(self, df: pd.DataFrame, output_dir: str) -> pd.DataFrame:
-        """Processes TF-IDF of skills."""
-        self.logger.info("Generating TF-IDF of skills...")
+    def process_tfidf(self, df: pd.DataFrame, output_dir: str):
+        # TF-IDF for onet_skills
+        self.logger.info("Generating TF-IDF for skills...")
         skills_str = df['onet_skills'].apply(' '.join)
-        tfidf_matrix = self.tfidf_vectorizer.fit_transform(skills_str)
+        tfidf_matrix_skills = self.tfidf_vectorizer_skills.fit_transform(skills_str)
         
-        tfidf_df = pd.DataFrame(
-            tfidf_matrix.toarray(),
-            columns=self.tfidf_vectorizer.get_feature_names_out()
-        )
-        tfidf_df.insert(0, 'job_id', df['job_id'])
+        tfidf_df_skills = pd.DataFrame(tfidf_matrix_skills.toarray(), columns=self.tfidf_vectorizer_skills.get_feature_names_out())
+        tfidf_df_skills.insert(0, 'job_id', df['job_id'])
+        skills_output_path = Path(output_dir) / 'dataset_skills_tfidf.csv'
+        tfidf_df_skills.to_csv(skills_output_path, index=False)
+        self.logger.info(f"Skills TF-IDF saved at: {skills_output_path}")
+
+        # TF-IDF for job_summary
+        self.logger.info("Generating TF-IDF for job summary...")
+        tfidf_matrix_summary = self.tfidf_vectorizer_summary.fit_transform(df['job_summary'])
         
-        output_path = Path(output_dir) / 'dataset_skills_tfidf.csv'
-        tfidf_df.to_csv(output_path, index=False)
-        self.logger.info(f"TF-IDF saved at: {output_path}")
-        return tfidf_df
+        tfidf_df_summary = pd.DataFrame(tfidf_matrix_summary.toarray(), columns=self.tfidf_vectorizer_summary.get_feature_names_out())
+        tfidf_df_summary.insert(0, 'job_id', df['job_id'])
+        summary_output_path = Path(output_dir) / 'dataset_summary_tfidf.csv'
+        tfidf_df_summary.to_csv(summary_output_path, index=False)
+        self.logger.info(f"Job summary TF-IDF saved at: {summary_output_path}")
 
     def get_bert_embeddings(self, text: str, max_length: int = 512) -> np.ndarray:
-        """
-        Obtains BERT embeddings for a text, handling long texts.
-        """
         inputs = self.tokenizer(text, return_tensors="pt", truncation=False, padding=False)
         input_ids = inputs['input_ids'][0]
         
@@ -103,7 +91,6 @@ class JobSkillsProcessor:
         return np.mean(embeddings_list, axis=0)
 
     def process_bert_embeddings(self, df: pd.DataFrame, output_dir: str):
-        """Processes BERT embeddings for skills and summaries."""
         self.logger.info("Generating embeddings with BERT...")
         
         job_skills_embeddings = []
@@ -116,12 +103,10 @@ class JobSkillsProcessor:
             job_skills_embeddings.append(self.get_bert_embeddings(skills_text))
             job_summary_embeddings.append(self.get_bert_embeddings(summary_text))
             
-            # Memory cleanup every few iterations
             if len(job_skills_embeddings) % 100 == 0:
                 torch.cuda.empty_cache()
                 gc.collect()
         
-        # Save embeddings
         output_skills = Path(output_dir) / 'onet_skills_embeddings.npy'
         output_summary = Path(output_dir) / 'job_summary_embeddings.npy'
         
@@ -130,15 +115,12 @@ class JobSkillsProcessor:
         self.logger.info(f"Embeddings saved at: {output_dir}")
 
     def process_dataset(self, input_file: str, output_dir: str = 'outputs'):
-        """Processes the entire dataset."""
         output_dir = self.ensure_output_dir(output_dir)
         self.logger.info(f"Processing dataset: {input_file}")
         
-        # Load dataset
         df = pd.read_csv(input_file)
         df['onet_skills'] = df['onet_skills'].apply(eval)
         
-        # Process each step
         self.process_skills_binarization(df, output_dir)
         self.process_tfidf(df, output_dir)
         self.process_bert_embeddings(df, output_dir)
@@ -151,3 +133,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
