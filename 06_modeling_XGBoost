@@ -1,0 +1,153 @@
+import pandas as pd
+import numpy as np
+import xgboost as xgb
+from sklearn.metrics import accuracy_score, f1_score, hamming_loss
+from time import time
+import pickle
+import gc
+from tqdm import tqdm
+import os
+
+# Model parameters
+n_estimators = 50
+learning_rate = 0.1
+max_depth = 4
+
+# Output path to save the model
+output_dir = 'xgboost_checkpoints'
+model_path = f'{output_dir}/xgboost_model_checkpoint.pkl'
+os.makedirs(output_dir, exist_ok=True)
+
+def load_and_prepare_data():
+    """Loads and prepares data for training and testing"""
+    print("Loading and preparing data...")
+
+    # Load job_summary TF-IDF and binarized skills
+    job_summary_tfidf = pd.read_csv('dataset_jobsummary_tfidf.csv')
+    skills_binarized = pd.read_csv('dataset_skills_binarized.csv')
+
+    # Ensure indices match
+    common_indices = job_summary_tfidf['job_id'].isin(skills_binarized['job_id'])
+    job_summary_tfidf = job_summary_tfidf[common_indices]
+    skills_binarized = skills_binarized[skills_binarized['job_id'].isin(job_summary_tfidf['job_id'])]
+
+    # Sort both dataframes by job_id to ensure alignment
+    job_summary_tfidf = job_summary_tfidf.sort_values('job_id')
+    skills_binarized = skills_binarized.sort_values('job_id')
+
+    # Prepare data by removing ID columns and converting to numpy arrays
+    X = job_summary_tfidf.drop(columns=['job_id']).to_numpy()
+    y = skills_binarized.drop(columns=['job_id']).to_numpy()
+
+    # Check dimensions
+    print(f"Dimensions of X: {X.shape}")
+    print(f"Dimensions of y: {y.shape}")
+
+    # Free unnecessary memory
+    del job_summary_tfidf, skills_binarized
+    gc.collect()
+
+    return X, y
+
+def train_model(X_train, y_train):
+    """Trains the XGBoost model"""
+    print("\nStarting XGBoost model training...")
+    
+    models = []  # List to save one model per skill batch
+    batch_size = 5
+    n_skills = y_train.shape[1]
+    
+    start_time = time()
+    
+    try:
+        for i in tqdm(range(0, n_skills, batch_size), desc="Training skill batches", unit="batch"):
+            end_idx = min(i + batch_size, n_skills)
+            current_batch = y_train[:, i:end_idx]
+            
+            # Create a new model for each batch
+            batch_model = xgb.XGBClassifier(
+                objective='binary:logistic',
+                n_estimators=n_estimators,
+                learning_rate=learning_rate,
+                max_depth=max_depth,
+                tree_method='hist',
+                device='cuda',
+                eval_metric='logloss'
+            )
+            
+            # Train the model for the current batch
+            batch_model.fit(X_train, current_batch)
+            models.append((i, end_idx, batch_model))
+            
+    except Exception as e:
+        print(f"Error during training: {str(e)}")
+        return None
+
+    training_time = time() - start_time
+    print(f"\nTraining completed in {training_time:.2f} seconds.")
+    return models
+
+def evaluate_model(models, X_test, y_test):
+    """Evaluates the model and displays metrics"""
+    print("Evaluating the model...")
+    
+    # Initialize array for predictions
+    y_pred = np.zeros(y_test.shape)
+    
+    # Make predictions by batch
+    for start_idx, end_idx, model in models:
+        batch_pred = model.predict(X_test)
+        y_pred[:, start_idx:end_idx] = batch_pred
+    
+    accuracy = accuracy_score(y_test.flatten(), y_pred.flatten())
+    f1_micro = f1_score(y_test.flatten(), y_pred.flatten(), average='micro', zero_division=0)
+    f1_macro = f1_score(y_test.flatten(), y_pred.flatten(), average='macro', zero_division=0)
+    hamming = hamming_loss(y_test, y_pred)
+
+    print("\nEvaluation Results:")
+    print(f"Accuracy: {accuracy:.4f}")
+    print(f"F1 Score (Micro): {f1_micro:.4f}")
+    print(f"F1 Score (Macro): {f1_macro:.4f}")
+    print(f"Hamming Loss: {hamming:.4f}")
+
+    return {
+        "accuracy": accuracy,
+        "f1_micro": f1_micro,
+        "f1_macro": f1_macro,
+        "hamming_loss": hamming
+    }
+
+def save_model(models, path):
+    """Saves the trained models to disk"""
+    if models:
+        with open(path, 'wb') as f:
+            pickle.dump(models, f)
+        print(f"Models saved at {path}")
+    else:
+        print("Models were not saved due to an error in training.")
+
+def main():
+    # Load and prepare data
+    X, y = load_and_prepare_data()
+    
+    # Split data into training and testing
+    split_ratio = 0.8
+    split_index = int(split_ratio * X.shape[0])
+    indices = np.random.permutation(X.shape[0])
+    
+    train_idx, test_idx = indices[:split_index], indices[split_index:]
+    X_train, X_test = X[train_idx], X[test_idx]
+    y_train, y_test = y[train_idx], y[test_idx]
+    
+    print(f"Training dimensions - X: {X_train.shape}, y: {y_train.shape}")
+    print(f"Testing dimensions - X: {X_test.shape}, y: {y_test.shape}")
+
+    models = train_model(X_train, y_train)
+    if models:
+        evaluation_results = evaluate_model(models, X_test, y_test)
+        save_model(models, model_path)
+    else:
+        print("Training failed; models were not saved.")
+
+if __name__ == "__main__":
+    main()
