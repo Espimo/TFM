@@ -1,0 +1,143 @@
+import pandas as pd
+import numpy as np
+import xgboost as xgb
+from sklearn.metrics import accuracy_score, f1_score, hamming_loss
+from sklearn.model_selection import train_test_split, KFold
+from time import time
+import pickle
+import gc
+import os
+from tqdm import tqdm  # Import tqdm for progress bar
+
+# Directorio de salida para guardar el mejor modelo
+output_dir = 'xgboost_optimization'
+model_path = f'{output_dir}/best_xgboost_model.pkl'
+os.makedirs(output_dir, exist_ok=True)
+
+# Simplified parameter grid
+param_grid = {
+    'learning_rate': [0.1, 0.2],
+    'max_depth': [3, 5],
+    'n_estimators': [10, 20]
+}
+
+def load_and_prepare_data():
+    """Loads and prepares data for training and testing"""
+    print("Loading and preparing data...")
+
+    # Load job_summary TF-IDF and binarized skills
+    job_summary_tfidf = pd.read_csv('dataset_jobsummary_tfidf.csv')
+    skills_binarized = pd.read_csv('dataset_skills_binarizado.csv')
+
+    # Ensure indices match
+    common_indices = job_summary_tfidf['job_id'].isin(skills_binarized['job_id'])
+    job_summary_tfidf = job_summary_tfidf[common_indices]
+    skills_binarized = skills_binarized[skills_binarized['job_id'].isin(job_summary_tfidf['job_id'])]
+
+    # Sort both dataframes by job_id to ensure alignment
+    job_summary_tfidf = job_summary_tfidf.sort_values('job_id')
+    skills_binarized = skills_binarized.sort_values('job_id')
+
+    # Prepare data by removing ID columns and converting to numpy arrays
+    X = job_summary_tfidf.drop(columns=['job_id']).to_numpy()
+    y = skills_binarized.drop(columns=['job_id']).to_numpy()
+
+    # Free unnecessary memory
+    del job_summary_tfidf, skills_binarized
+    gc.collect()
+
+    return X, y
+
+def optimize_hyperparameters(X_train, y_train):
+    """Optimizes XGBoost hyperparameters using a simplified grid search"""
+    best_score = 0
+    best_params = None
+    param_combinations = [
+        {'learning_rate': lr, 'max_depth': depth, 'n_estimators': n_est}
+        for lr in param_grid['learning_rate']
+        for depth in param_grid['max_depth']
+        for n_est in param_grid['n_estimators']
+    ]
+    
+    kf = KFold(n_splits=2)
+    
+    # Barra de progreso para seguimiento de tiempo y combinaciones
+    with tqdm(total=len(param_combinations), desc="Optimización de Hiperparámetros") as pbar:
+        for params in param_combinations:
+            model = xgb.XGBClassifier(
+                learning_rate=params['learning_rate'],
+                max_depth=params['max_depth'],
+                n_estimators=params['n_estimators'],
+                objective='binary:logistic',
+                eval_metric='logloss',
+                tree_method='hist'
+            )
+            scores = []
+            
+            for train_idx, test_idx in kf.split(X_train):
+                X_fold_train, X_fold_test = X_train[train_idx], X_train[test_idx]
+                y_fold_train, y_fold_test = y_train[train_idx], y_train[test_idx]
+
+                # Train the model and evaluate
+                model.fit(X_fold_train, y_fold_train)
+                preds = model.predict(X_fold_test)
+                f1 = f1_score(y_fold_test.flatten(), preds.flatten(), average='macro')
+                scores.append(f1)
+
+            mean_score = np.mean(scores)
+            print(f"Params: {params}, F1 Macro: {mean_score}")
+
+            # Update best model if current model is better
+            if mean_score > best_score:
+                best_score = mean_score
+                best_params = params
+            
+            # Actualiza la barra de progreso
+            pbar.update(1)
+
+    print("Best Parameters:", best_params)
+    return best_params
+
+def train_best_model(X_train, y_train, best_params):
+    """Train the model with the best hyperparameters and save it"""
+    print("\nTraining model with best hyperparameters...")
+    model = xgb.XGBClassifier(
+        learning_rate=best_params['learning_rate'],
+        max_depth=best_params['max_depth'],
+        n_estimators=best_params['n_estimators'],
+        objective='binary:logistic',
+        eval_metric='logloss',
+        tree_method='hist'
+    )
+    model.fit(X_train, y_train)
+    
+    # Save the trained model
+    with open(model_path, 'wb') as f:
+        pickle.dump(model, f)
+    print(f"Model saved at {model_path}")
+
+def main():
+    # Load and prepare data
+    X, y = load_and_prepare_data()
+
+    # Split data into training and testing
+    split_ratio = 0.8
+    split_index = int(split_ratio * X.shape[0])
+    indices = np.random.permutation(X.shape[0])
+
+    train_idx, test_idx = indices[:split_index], indices[split_index:]
+    X_train, X_test = X[train_idx], X[test_idx]
+    y_train, y_test = y[train_idx], y[test_idx]
+
+    print(f"Training dimensions - X: {X_train.shape}, y: {y_train.shape}")
+    print(f"Testing dimensions - X: {X_test.shape}, y: {y_test.shape}")
+
+    # Run hyperparameter optimization
+    best_params = optimize_hyperparameters(X_train, y_train)
+
+    # Train the best model with optimized hyperparameters
+    if best_params:
+        train_best_model(X_train, y_train, best_params)
+
+if __name__ == "__main__":
+    main()
