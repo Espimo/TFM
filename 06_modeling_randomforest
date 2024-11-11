@@ -1,0 +1,117 @@
+import pandas as pd
+import numpy as np
+import joblib
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, f1_score, hamming_loss
+from pathlib import Path
+import time
+from memory_profiler import profile
+from joblib import parallel_backend
+import gc
+
+@profile
+def load_and_prepare_data():
+    """Loads and prepares data in an optimized way"""
+    # Load data using chunks to manage memory better
+    job_summary_tfidf = pd.read_csv('dataset_jobsummary_tfidf.csv', chunksize=10000)
+    skills_binarized = pd.read_csv('dataset_skills_binarized.csv', chunksize=10000)
+    
+    # Concatenate the chunks
+    X = pd.concat(job_summary_tfidf)
+    y = pd.concat(skills_binarized)
+    
+    # Convert to numpy arrays for better performance
+    X_data = X.drop(columns=['job_id']).to_numpy()
+    y_data = y.drop(columns=['job_id']).to_numpy()
+    
+    # Memory cleanup
+    del X, y
+    gc.collect()
+    
+    return X_data, y_data
+
+def create_model(n_jobs=None):
+    """Creates an optimized Random Forest model"""
+    return RandomForestClassifier(
+        n_estimators=100,
+        random_state=42,
+        n_jobs=n_jobs,
+        verbose=1,
+        # Additional parameters for memory and speed optimization
+        max_depth=None,
+        min_samples_split=2,
+        min_samples_leaf=1,
+        bootstrap=True,
+        warm_start=True  # Allows incremental training
+    )
+
+def train_model_in_batches(model, X_train, y_train, batch_size=20):
+    """Trains the model in batches for better memory management"""
+    n_estimators_per_batch = batch_size
+    total_estimators = model.n_estimators
+    
+    for i in range(0, total_estimators, n_estimators_per_batch):
+        print(f"\nTraining batch of trees {i} to {min(i + n_estimators_per_batch, total_estimators)}")
+        model.n_estimators = min(i + n_estimators_per_batch, total_estimators)
+        model.fit(X_train, y_train)
+        
+        # Memory cleanup after each batch
+        gc.collect()
+
+def evaluate_model(model, X_test, y_test):
+    """Evaluates the model and returns metrics"""
+    y_pred = model.predict(X_test)
+    return {
+        'accuracy': accuracy_score(y_test, y_pred),
+        'f1_micro': f1_score(y_test, y_pred, average='micro'),
+        'f1_macro': f1_score(y_test, y_pred, average='macro'),
+        'hamming': hamming_loss(y_test, y_pred)
+    }
+
+def main():
+    # Set up the output directory
+    output_dir = Path('random_forest_checkpoints')
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    print("Loading and preparing data...")
+    X, y = load_and_prepare_data()
+    
+    # Data split
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42
+    )
+    
+    # Memory cleanup after split
+    del X, y
+    gc.collect()
+    
+    # Create and train the model
+    print("\nStarting model training...")
+    start_time = time.time()
+    
+    with parallel_backend('threading', n_jobs=4):  # Adjust n_jobs according to your CPU
+        model = create_model(n_jobs=4)  # Adjust according to your CPU
+        train_model_in_batches(model, X_train, y_train)
+    
+    training_time = time.time() - start_time
+    print(f"\nTraining completed in {training_time:.2f} seconds.")
+    
+    # Save the model
+    checkpoint_path = output_dir / 'random_forest_model_checkpoint.pkl'
+    joblib.dump(model, checkpoint_path)
+    print(f"Model saved at {checkpoint_path}")
+    
+    # Evaluation
+    print("\nEvaluating the model...")
+    metrics = evaluate_model(model, X_test, y_test)
+    
+    # Print results
+    print("\nEvaluation Results:")
+    print(f"Accuracy: {metrics['accuracy']:.4f}")
+    print(f"F1 Score (Micro): {metrics['f1_micro']:.4f}")
+    print(f"F1 Score (Macro): {metrics['f1_macro']:.4f}")
+    print(f"Hamming Loss: {metrics['hamming']:.4f}")
+
+if __name__ == "__main__":
+    main()
