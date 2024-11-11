@@ -1,0 +1,129 @@
+import pandas as pd
+import numpy as np
+import os  # Added to create directories
+from sklearn.svm import LinearSVC
+from sklearn.metrics import accuracy_score, f1_score, hamming_loss
+from sklearn.model_selection import train_test_split
+from time import time
+import pickle
+from tqdm import tqdm
+import gc
+
+# Model parameters
+C = 1.0  # Regularization parameter
+
+# Output path to save the model
+output_dir = 'svm_checkpoints'
+model_path = f'{output_dir}/svm_model_checkpoint.pkl'
+
+# Ensure the output directory exists
+os.makedirs(output_dir, exist_ok=True)
+
+def load_and_prepare_data():
+    """Loads and prepares data for training and testing"""
+    print("Loading and preparing data...")
+
+    # Load job_summary TF-IDF and binarized skills
+    job_summary_tfidf = pd.read_csv('dataset_jobsummary_tfidf.csv')
+    skills_binarized = pd.read_csv('dataset_skills_binarized.csv')
+
+    # Ensure indices match
+    common_indices = job_summary_tfidf['job_id'].isin(skills_binarized['job_id'])
+    job_summary_tfidf = job_summary_tfidf[common_indices]
+    skills_binarized = skills_binarized[skills_binarized['job_id'].isin(job_summary_tfidf['job_id'])]
+
+    # Sort both dataframes by job_id to ensure alignment
+    job_summary_tfidf = job_summary_tfidf.sort_values('job_id')
+    skills_binarized = skills_binarized.sort_values('job_id')
+
+    # Prepare data by removing ID columns and converting to numpy arrays
+    X = job_summary_tfidf.drop(columns=['job_id']).to_numpy()
+    y = skills_binarized.drop(columns=['job_id']).to_numpy()
+
+    # Check dimensions
+    print(f"Dimensions of X: {X.shape}")
+    print(f"Dimensions of y: {y.shape}")
+
+    # Free unnecessary memory
+    del job_summary_tfidf, skills_binarized
+    gc.collect()
+
+    return X, y
+
+def train_model(X_train, y_train):
+    """Trains the SVM model for each skill (binary classification)"""
+    print("\nStarting SVM model training...")
+
+    models = []  # List to save one model per skill
+    n_skills = y_train.shape[1]
+    
+    start_time = time()
+    
+    for i in tqdm(range(n_skills), desc="Training SVM models per skill"):
+        # Create a new SVM model for each skill
+        model = LinearSVC(C=C, max_iter=1000, verbose=0)
+        
+        # Train the model for each skill (binary task)
+        model.fit(X_train, y_train[:, i])
+        models.append(model)
+        
+    training_time = time() - start_time
+    print(f"\nTraining completed in {training_time:.2f} seconds.")
+    return models
+
+def evaluate_model(models, X_test, y_test):
+    """Evaluates the SVM model and displays metrics"""
+    print("Evaluating the model...")
+
+    # Initialize array for predictions
+    y_pred = np.zeros(y_test.shape)
+    
+    # Make predictions per skill
+    for i, model in enumerate(models):
+        y_pred[:, i] = model.predict(X_test)
+    
+    accuracy = accuracy_score(y_test, y_pred)
+    f1_micro = f1_score(y_test, y_pred, average='micro', zero_division=0)
+    f1_macro = f1_score(y_test, y_pred, average='macro', zero_division=0)
+    hamming = hamming_loss(y_test, y_pred)
+
+    print("\nEvaluation Results:")
+    print(f"Accuracy: {accuracy:.4f}")
+    print(f"F1 Score (Micro): {f1_micro:.4f}")
+    print(f"F1 Score (Macro): {f1_macro:.4f}")
+    print(f"Hamming Loss: {hamming:.4f}")
+
+    return {
+        "accuracy": accuracy,
+        "f1_micro": f1_micro,
+        "f1_macro": f1_macro,
+        "hamming_loss": hamming
+    }
+
+def save_model(models, path):
+    """Saves the trained models to disk"""
+    with open(path, 'wb') as f:
+        pickle.dump(models, f)
+    print(f"Models saved at {path}")
+
+def main():
+    # Load and prepare data
+    X, y = load_and_prepare_data()
+    
+    # Split data into training and testing
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    print(f"Training dimensions - X: {X_train.shape}, y: {y_train.shape}")
+    print(f"Testing dimensions - X: {X_test.shape}, y: {y_test.shape}")
+
+    # Train the model
+    models = train_model(X_train, y_train)
+
+    # Evaluate the model
+    evaluation_results = evaluate_model(models, X_test, y_test)
+
+    # Save the model
+    save_model(models, model_path)
+
+if __name__ == "__main__":
+    main()
