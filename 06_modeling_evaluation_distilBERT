@@ -1,0 +1,161 @@
+import pandas as pd
+import numpy as np
+import tensorflow as tf
+from transformers import DistilBertTokenizerFast, TFDistilBertForSequenceClassification
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import hamming_loss, accuracy_score, f1_score
+import os
+import json
+from datetime import datetime
+
+# Initial configuration
+batch_size = 16
+max_length = 128
+output_dir = 'job_classification_model'
+
+# Logging configuration
+log_file = os.path.join(output_dir, 'evaluation_log.txt')
+os.makedirs(output_dir, exist_ok=True)
+
+def log_message(message):
+    """Logs a message to both console and file"""
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    log_entry = f"[{timestamp}] {message}"
+    print(log_entry)
+    with open(log_file, 'a', encoding='utf-8') as f:
+        f.write(log_entry + '\n')
+
+# GPU configuration
+tf.config.set_soft_device_placement(True)
+physical_devices = tf.config.list_physical_devices('GPU')
+if physical_devices:
+    try:
+        for device in physical_devices:
+            tf.config.experimental.set_memory_growth(device, True)
+        log_message("GPU configured for dynamic memory growth")
+    except RuntimeError as e:
+        log_message(f"Error configuring GPU: {e}")
+else:
+    log_message("No GPUs detected. Evaluation will proceed on CPU")
+
+def load_and_preprocess_data(min_samples_per_class=2):
+    log_message("Loading and preprocessing data for evaluation...")
+
+    df = pd.read_csv('dataset_ready.csv', usecols=['job_summary'])
+    df = df.dropna(subset=['job_summary'])
+    texts = df['job_summary'].astype(str).tolist()
+
+    labels_df = pd.read_csv('dataset_skills_binarized.csv', dtype=np.int8)
+
+    # Apply the same label filtering as during training
+    class_counts = labels_df.sum()
+    valid_columns = class_counts[class_counts >= min_samples_per_class].index
+    labels_df = labels_df[valid_columns]
+    labels = labels_df.values
+    label_list = valid_columns.tolist()
+
+    log_message(f"Number of labels after filtering: {len(label_list)}")
+
+    assert len(texts) == labels.shape[0], "Mismatch in data dimensions"
+
+    # Split data into train and test
+    try:
+        texts_train, texts_test, y_train, y_test = train_test_split(
+            texts,
+            labels,
+            test_size=0.2,
+            random_state=42,
+            stratify=labels_df.sum(axis=1)
+        )
+        log_message("Stratified split successful")
+    except ValueError as e:
+        log_message(f"Error in stratified split: {e}")
+        texts_train, texts_test, y_train, y_test = train_test_split(
+            texts,
+            labels,
+            test_size=0.2,
+            random_state=42
+        )
+
+    log_message(f"Data split completed:")
+    log_message(f"- Training samples: {len(texts_train)}")
+    log_message(f"- Test samples: {len(texts_test)}")
+
+    return texts_test, y_test, label_list
+
+def create_tf_dataset(texts, labels, tokenizer):
+    encodings = tokenizer(
+        texts,
+        truncation=True,
+        padding='max_length',
+        max_length=max_length,
+        return_tensors='tf'
+    )
+
+    dataset = tf.data.Dataset.from_tensor_slices((dict(encodings), labels))
+    dataset = dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    return dataset
+
+def compute_metrics(y_true, y_pred):
+    metrics = {
+        'hamming_loss': hamming_loss(y_true, y_pred),
+        'exact_match_ratio': accuracy_score(y_true, y_pred),
+        'f1_score_micro': f1_score(y_true, y_pred, average='micro', zero_division=0),
+        'f1_score_macro': f1_score(y_true, y_pred, average='macro', zero_division=0)
+    }
+    return metrics
+
+def main():
+    log_message("Starting evaluation of the saved model...")
+
+    texts_test, y_test, label_list = load_and_preprocess_data(min_samples_per_class=2)
+    num_labels = len(label_list)
+
+    log_message(f"Number of labels: {num_labels}")
+
+    # Load tokenizer and model from saved directory
+    log_message("Loading tokenizer and model from the saved directory...")
+    tokenizer = DistilBertTokenizerFast.from_pretrained(output_dir)
+    base_model = TFDistilBertForSequenceClassification.from_pretrained(output_dir)
+
+    # Create test dataset
+    log_message("Creating test dataset...")
+    test_dataset = create_tf_dataset(texts_test, y_test, tokenizer)
+
+    # Evaluation
+    log_message("Evaluating model...")
+    y_pred_logits = base_model.predict(test_dataset).logits
+    y_pred = tf.sigmoid(y_pred_logits).numpy()
+    y_pred = (y_pred >= 0.6).astype(int)
+
+    metrics_results = compute_metrics(y_test, y_pred)
+
+    # Save evaluation metrics
+    with open(f'{output_dir}/evaluation_metrics.json', 'w') as f:
+        json.dump(metrics_results, f)
+
+    log_message("Evaluation metrics:")
+    for metric, value in metrics_results.items():
+        log_message(f"- {metric}: {value:.4f}")
+
+    log_message(f"Evaluation metrics saved to '{output_dir}/evaluation_metrics.json'")
+
+    # Example prediction
+    example_text = "Are you a data enthusiast looking to make an impact across multiple industries? Join a leading data consultancy in London that partners with clients in finance, retail, and healthcare to deliver data-driven solutions that transform their business operations. My client is seeking a data analyst with strong analytical skills and a passion for leveraging data to solve complex problems. In this role, you work with a diverse portfolio of clients, using data insights to drive meaningful business improvements. Your responsibilities: Analyze large datasets: Extract, clean, and analyze data from various sources to uncover trends and insights that inform key business strategies across finance, retail, and healthcare sectors. Support decision-making: Use statistical methods and predictive models to assist clients in making data-driven decisions that improve their performance and efficiency. Create data visualizations: Design and maintain interactive dashboards and visual reports to clearly communicate data insights to stakeholders. Collaborate with clients and internal teams: Work closely with cross-functional teams, including data scientists, consultants, and client representatives, to ensure that data projects align with client goals. Identify opportunities: Continuously explore ways to optimize processes, identify business opportunities, and deliver actionable recommendations to clients. You will need: Bachelor's degree in a quantitative field: preferably in statistics, mathematics, economics, computer science, or a related discipline. Experience with data analysis tools: proficiency in SQL, Python, or R for data analysis, manipulation, and reporting. Data visualization skills: experience with tools like Tableau, Power BI, or similar to present complex data in a user-friendly format. Strong analytical mindset: ability to understand and interpret complex datasets, drawing clear and actionable conclusions for clients. Excellent communication skills: capable of conveying technical information to both technical and non-technical audiences. It's a bonus if you have: Industry experience: prior experience working with clients in finance, retail, or healthcare, and familiarity with sector-specific data challenges. Exposure to advanced analytics: knowledge of machine learning techniques, predictive modeling, or advanced statistical analysis. Problem-solving approach: a proactive, solution-oriented mindset, with the ability to think critically and creatively. If you're a motivated data analyst eager to work with a variety of clients and industries, apply now to become part of a dynamic consultancy shaping the future of data-driven decision-making"
+    log_message("Performing example prediction...")
+    inputs = tokenizer(
+        example_text,
+        truncation=True,
+        padding='max_length',
+        max_length=max_length,
+        return_tensors='tf'
+    )
+    logits = base_model(inputs).logits
+    predictions = tf.sigmoid(logits).numpy()[0]
+    predicted_labels = [label_list[i] for i, pred in enumerate(predictions) if pred >= 0.5]
+
+    log_message(f"Example text: {example_text}")
+    log_message(f"Predicted labels: {predicted_labels}")
+
+if __name__ == "__main__":
+    main()
