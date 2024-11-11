@@ -1,0 +1,160 @@
+import os
+import joblib
+import pickle
+import numpy as np
+import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
+from transformers import DistilBertTokenizerFast, TFDistilBertForSequenceClassification
+import tensorflow as tf
+
+# Directory configuration
+models_dir = 'models'
+output_dir = 'output'
+tfidf_skills_path = os.path.join(models_dir, 'tfidf_vectorizer_skills.pkl')
+tfidf_summary_path = os.path.join(models_dir, 'tfidf_vectorizer_summary.pkl')
+
+# Model paths
+model_paths = {
+    'mlp': os.path.join(models_dir, 'mlp_model_checkpoint.pkl'),
+    'random_forest': os.path.join(models_dir, 'random_forest_model_checkpoint.pkl'),
+    'svm': os.path.join(models_dir, 'svm_model_checkpoint.pkl'),
+    'xgboost': os.path.join(models_dir, 'xgboost_model_checkpoint.json')  # Changed to .json
+}
+
+def create_or_load_vectorizers():
+    """Creates or loads the TF-IDF vectorizers"""
+    if os.path.exists(tfidf_skills_path) and os.path.exists(tfidf_summary_path):
+        with open(tfidf_skills_path, 'rb') as f:
+            tfidf_vectorizer_skills = pickle.load(f)
+        with open(tfidf_summary_path, 'rb') as f:
+            tfidf_vectorizer_summary = pickle.load(f)
+        print("TF-IDF vectorizers loaded.")
+    else:
+        print("Generating new TF-IDF vectorizers...")
+        df = pd.read_csv('dataset_ready.csv')
+        df['onet_skills'] = df['onet_skills'].apply(eval)
+        
+        tfidf_vectorizer_skills = TfidfVectorizer(max_features=10000, stop_words='english')
+        tfidf_vectorizer_summary = TfidfVectorizer(max_features=10000, stop_words='english')
+        
+        tfidf_vectorizer_skills.fit(df['onet_skills'].apply(' '.join))
+        tfidf_vectorizer_summary.fit(df['job_summary'])
+        
+        # Save vectorizers
+        os.makedirs(models_dir, exist_ok=True)
+        with open(tfidf_skills_path, 'wb') as f:
+            pickle.dump(tfidf_vectorizer_skills, f)
+        with open(tfidf_summary_path, 'wb') as f:
+            pickle.dump(tfidf_vectorizer_summary, f)
+        print("TF-IDF vectorizers generated and saved.")
+    
+    return tfidf_vectorizer_skills, tfidf_vectorizer_summary
+
+def load_models():
+    """Loads all ML models"""
+    models = {}
+    for model_name, path in model_paths.items():
+        try:
+            if model_name == 'xgboost':
+                import xgboost as xgb
+                model = xgb.XGBClassifier()
+                model.load_model(path)
+                models[model_name] = model
+                print(f"Model {model_name} loaded from {path}.")
+            else:
+                model = joblib.load(path)
+                models[model_name] = model
+                print(f"Model {model_name} loaded from {path}.")
+        except Exception as e:
+            print(f"Error loading model {model_name}: {str(e)}")
+    print("ML models loaded.")
+    return models
+
+def make_predictions(examples, models, tfidf_vectorizer_summary, tokenizer, distilbert_model):
+    """Makes predictions using all available models"""
+    # Vectorize the examples
+    tfidf_summary_vectors = tfidf_vectorizer_summary.transform(examples)
+    
+    # Prediction with ML models
+    predictions = {}
+    for model_name, model in models.items():
+        print(f"\nPredictions with {model_name}:")
+        try:
+            if isinstance(model, list):  # Case of batch training
+                pred_batch = np.zeros((tfidf_summary_vectors.shape[0], len(model)))
+                for i, submodel in enumerate(model):
+                    submodel_pred = submodel.predict(tfidf_summary_vectors)
+                    if submodel_pred.ndim == 1:
+                        pred_batch[:, i] = submodel_pred
+                    else:
+                        pred_batch[:, i] = submodel_pred[:, 0]
+                predictions[model_name] = pred_batch
+                print(pred_batch)
+            else:  # Single model case
+                # Check if model has the predict method
+                if hasattr(model, 'predict'):
+                    preds = model.predict(tfidf_summary_vectors)
+                    if isinstance(preds, np.ndarray):
+                        if preds.ndim == 1:
+                            predicted_skills = np.where(preds > 0.5, 1, 0).reshape(-1, 1)
+                        else:
+                            predicted_skills = np.where(preds > 0.5, 1, 0)
+                        predictions[model_name] = predicted_skills
+                        print(predicted_skills)
+                    else:
+                        print(f"The predictions from {model_name} are not of the expected type")
+                else:
+                    print(f"The model {model_name} does not have the predict method")
+        except Exception as e:
+            print(f"Error in prediction with {model_name}: {str(e)}")
+            continue
+
+    # Prediction with DistilBERT
+    print("\nPrediction with DistilBERT:")
+    for text in examples:
+        try:
+            inputs = tokenizer(
+                text,
+                truncation=True,
+                padding='max_length',
+                max_length=128,
+                return_tensors='tf'
+            )
+            logits = distilbert_model(inputs).logits
+            preds = tf.sigmoid(logits).numpy()[0]
+            predicted_labels = [i for i, pred in enumerate(preds) if pred >= 0.5]
+            print(f"Text: {text}")
+            print(f"Predicted skills: {predicted_labels}")
+        except Exception as e:
+            print(f"Error in prediction with DistilBERT: {str(e)}")
+    
+    return predictions
+
+def main():
+    # Load vectorizers
+    tfidf_vectorizer_skills, tfidf_vectorizer_summary = create_or_load_vectorizers()
+    
+    # Load ML models
+    models = load_models()
+    
+    # Load DistilBERT tokenizer and model
+    try:
+        tokenizer = DistilBertTokenizerFast.from_pretrained(models_dir + '/distilbert')
+        distilbert_model = TFDistilBertForSequenceClassification.from_pretrained(models_dir + '/distilbert')
+        print("DistilBERT model loaded successfully.")
+    except Exception as e:
+        print(f"Error loading DistilBERT: {str(e)}")
+        return
+
+    # Text examples for prediction
+    examples = [
+        "Data Analyst with SQL and Python experience needed for a fast-growing tech startup.",
+        "Seeking a Software Engineer skilled in Java and cloud computing for a multinational company.",
+        "Marketing specialist with experience in social media strategies and SEO."
+    ]
+
+    # Make predictions
+    predictions = make_predictions(examples, models, tfidf_vectorizer_summary, tokenizer, distilbert_model)
+
+if __name__ == "__main__":
+    main()
