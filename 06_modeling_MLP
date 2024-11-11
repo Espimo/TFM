@@ -1,0 +1,118 @@
+import pandas as pd
+import numpy as np
+from sklearn.neural_network import MLPClassifier
+from sklearn.metrics import accuracy_score, f1_score, hamming_loss
+from sklearn.model_selection import train_test_split
+from time import time
+import pickle
+from tqdm import tqdm
+import os
+
+# Configuración del modelo MLP
+hidden_layers = (256, 128, 64)
+activation = 'relu'
+max_iter = 100
+batch_size = 128
+
+# Ruta de salida para guardar el modelo
+output_dir = 'mlp_checkpoints'
+model_path = f'{output_dir}/mlp_model_checkpoint.pkl'
+os.makedirs(output_dir, exist_ok=True)
+
+def load_and_prepare_data():
+    """Carga y prepara los datos para entrenamiento y prueba"""
+    print("Cargando y preparando datos...")
+
+    # Cargar TF-IDF de job_summary y skills binarizados
+    job_summary_tfidf = pd.read_csv('dataset_jobsummary_tfidf.csv')
+    skills_binarized = pd.read_csv('dataset_skills_binarizado.csv')
+
+    # Asegurarse de que los índices coincidan
+    common_indices = job_summary_tfidf['job_id'].isin(skills_binarized['job_id'])
+    job_summary_tfidf = job_summary_tfidf[common_indices]
+    skills_binarized = skills_binarized[skills_binarized['job_id'].isin(job_summary_tfidf['job_id'])]
+
+    # Ordenar ambos dataframes por job_id para asegurar el alineamiento
+    job_summary_tfidf = job_summary_tfidf.sort_values('job_id')
+    skills_binarized = skills_binarized.sort_values('job_id')
+
+    # Preparar los datos eliminando las columnas de IDs y convirtiendo a arrays numpy
+    X = job_summary_tfidf.drop(columns=['job_id']).to_numpy()
+    y = skills_binarized.drop(columns=['job_id']).to_numpy()
+
+    print(f"Dimensiones de X: {X.shape}")
+    print(f"Dimensiones de y: {y.shape}")
+
+    return X, y
+
+def train_model(X_train, y_train):
+    """Entrena el modelo MLP"""
+    print("\nIniciando entrenamiento del modelo MLP...")
+
+    model = MLPClassifier(
+        hidden_layer_sizes=hidden_layers,
+        activation=activation,
+        max_iter=max_iter,
+        batch_size=batch_size,
+        random_state=42,
+        verbose=True
+    )
+
+    start_time = time()
+    model.fit(X_train, y_train)
+    training_time = time() - start_time
+    print(f"\nEntrenamiento completado en {training_time:.2f} segundos.")
+    
+    return model
+
+def evaluate_model(model, X_test, y_test):
+    """Evalúa el modelo y muestra métricas"""
+    print("Evaluando el modelo...")
+
+    y_pred = model.predict(X_test)
+
+    accuracy = accuracy_score(y_test, y_pred)
+    f1_micro = f1_score(y_test, y_pred, average='micro')
+    f1_macro = f1_score(y_test, y_pred, average='macro')
+    hamming = hamming_loss(y_test, y_pred)
+
+    print("\nResultados de evaluación:")
+    print(f"Exactitud: {accuracy:.4f}")
+    print(f"F1 Score (Micro): {f1_micro:.4f}")
+    print(f"F1 Score (Macro): {f1_macro:.4f}")
+    print(f"Hamming Loss: {hamming:.4f}")
+
+    return {
+        "accuracy": accuracy,
+        "f1_micro": f1_micro,
+        "f1_macro": f1_macro,
+        "hamming_loss": hamming
+    }
+
+def save_model(model, path):
+    """Guarda el modelo entrenado en el disco"""
+    with open(path, 'wb') as f:
+        pickle.dump(model, f)
+    print(f"Modelo guardado en {path}")
+
+def main():
+    # Cargar y preparar datos
+    X, y = load_and_prepare_data()
+    
+    # Dividir datos en entrenamiento y prueba
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    print(f"Dimensiones de entrenamiento - X: {X_train.shape}, y: {y_train.shape}")
+    print(f"Dimensiones de prueba - X: {X_test.shape}, y: {y_test.shape}")
+
+    # Entrenar el modelo
+    model = train_model(X_train, y_train)
+
+    # Guardar el modelo justo después de completar el entrenamiento
+    save_model(model, model_path)
+
+    # Evaluar el modelo
+    evaluation_results = evaluate_model(model, X_test, y_test)
+
+if __name__ == "__main__":
+    main()
