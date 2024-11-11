@@ -8,10 +8,6 @@ from difflib import SequenceMatcher
 from nltk.metrics.distance import edit_distance
 import numpy as np
 
-# -------------------------------------------------------------------------------------
-# Code from '019_filter_skills_by_onet.py': Filter ONET Skills in the Dataset
-# -------------------------------------------------------------------------------------
-
 def clean_skills(skills_str):
     """Clean and split skills string into a list"""
     if pd.isna(skills_str):
@@ -73,9 +69,6 @@ dataset = dataset.sort_values('job_id')
 
 dataset.to_csv('dataset_with_onet_column.csv', index=False)
 
-# -------------------------------------------------------------------------------------
-# Code from '020_correct_skills.py': Correct Skills in Dataset
-# -------------------------------------------------------------------------------------
 
 def calculate_similarity_ratio(str1, str2):
     """Calculate similarity ratio between two strings"""
@@ -118,9 +111,6 @@ similarity_results = [
 dataset, _, _ = correct_skills_in_dataset(dataset, similarity_results, similarity_threshold=0.9)
 dataset.to_csv('dataset_with_onet_column_corrected.csv', index=False)
 
-# -------------------------------------------------------------------------------------
-# Code from '021_refilter_skills_by_onet.py': Re-filter ONET Skills in Corrected Dataset
-# -------------------------------------------------------------------------------------
 
 print("Starting re-filtering ONET skills...")
 
@@ -144,9 +134,6 @@ dataset = dataset[['job_id', 'job_category', 'job_title', 'job_level', 'onet_ski
 dataset = dataset.sort_values('job_id')
 dataset.to_csv('final_dataset.csv', index=False)
 
-# -------------------------------------------------------------------------------------
-# Code from '022_remove_r_j_c_go.py': Remove "r", "c", "j", "go" from ONET Skills Column
-# -------------------------------------------------------------------------------------
 
 print("Removing specific skills 'r', 'c', 'j', 'go'...")
 
@@ -161,9 +148,6 @@ skills_to_remove = ["r", "c", "j", "go"]
 df["onet_skills"] = df["onet_skills"].apply(lambda x: remove_specific_skills(str(x), skills_to_remove))
 df.to_csv("final_dataset.csv", index=False)
 
-# -------------------------------------------------------------------------------------
-# Code from '023_analyze_onet_skills.py': Analyze ONET Skills
-# -------------------------------------------------------------------------------------
 
 print("Analyzing ONET skills...")
 
@@ -197,9 +181,6 @@ def analyze_skills(column):
 
 analyze_skills(df["onet_skills"])
 
-# -------------------------------------------------------------------------------------
-# Code from '024_remove_duplicates_and_nulls.py': Remove Duplicates and Nulls from Dataset
-# -------------------------------------------------------------------------------------
 
 print("Removing duplicates and nulls...")
 
