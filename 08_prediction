@@ -18,7 +18,7 @@ model_paths = {
     'mlp': os.path.join(models_dir, 'mlp_model_checkpoint.pkl'),
     'random_forest': os.path.join(models_dir, 'random_forest_model_checkpoint.pkl'),
     'svm': os.path.join(models_dir, 'svm_model_checkpoint.pkl'),
-    'xgboost': os.path.join(models_dir, 'xgboost_model_checkpoint.json')  # Changed to .json
+    'xgboost': os.path.join(models_dir, 'xgboost_model_checkpoint.pkl')
 }
 
 def create_or_load_vectorizers():
@@ -56,9 +56,8 @@ def load_models():
     for model_name, path in model_paths.items():
         try:
             if model_name == 'xgboost':
-                import xgboost as xgb
-                model = xgb.XGBClassifier()
-                model.load_model(path)
+                with open(path, 'rb') as f:
+                    model = pickle.load(f)
                 models[model_name] = model
                 print(f"Model {model_name} loaded from {path}.")
             else:
@@ -66,21 +65,43 @@ def load_models():
                 models[model_name] = model
                 print(f"Model {model_name} loaded from {path}.")
         except Exception as e:
-            print(f"Error loading model {model_name}: {str(e)}")
+            print(f"Error loading the model {model_name}: {str(e)}")
     print("ML models loaded.")
     return models
 
-def make_predictions(examples, models, tfidf_vectorizer_summary, tokenizer, distilbert_model):
-    """Makes predictions using all available models"""
+def get_index_to_skill_mapping(skills_binarized_csv_path):
+    """Obtains the mapping from index to skill name from the binarized CSV file."""
+    skills_df = pd.read_csv(skills_binarized_csv_path)
+    # Exclude the 'job_id' column if present
+    skill_columns = [col for col in skills_df.columns if col != 'job_id']
+    index_to_skill = {index: skill for index, skill in enumerate(skill_columns)}
+    return index_to_skill
+
+def make_predictions(examples, models, tfidf_vectorizer_summary, tokenizer, distilbert_model, index_to_skill):
+    """Makes predictions using all available models and displays the skill names"""
     # Vectorize the examples
     tfidf_summary_vectors = tfidf_vectorizer_summary.transform(examples)
     
-    # Prediction with ML models
+    # Predictions with ML models
     predictions = {}
     for model_name, model in models.items():
         print(f"\nPredictions with {model_name}:")
         try:
-            if isinstance(model, list):  # Case of batch training
+            if model_name == 'xgboost':
+                # Initialize array to store predictions
+                n_samples = tfidf_summary_vectors.shape[0]
+                n_skills = sum([end_idx - start_idx for start_idx, end_idx, _ in model])
+                xgb_preds = np.zeros((n_samples, n_skills))
+                skill_idx = 0
+                
+                for start_idx, end_idx, submodel in model:
+                    batch_pred = submodel.predict(tfidf_summary_vectors)
+                    batch_size = end_idx - start_idx
+                    xgb_preds[:, skill_idx:skill_idx+batch_size] = batch_pred
+                    skill_idx += batch_size
+                predicted_skills = np.where(xgb_preds > 0.5, 1, 0)
+                predictions[model_name] = predicted_skills
+            elif isinstance(model, list):  # Batch training case for other models
                 pred_batch = np.zeros((tfidf_summary_vectors.shape[0], len(model)))
                 for i, submodel in enumerate(model):
                     submodel_pred = submodel.predict(tfidf_summary_vectors)
@@ -88,10 +109,10 @@ def make_predictions(examples, models, tfidf_vectorizer_summary, tokenizer, dist
                         pred_batch[:, i] = submodel_pred
                     else:
                         pred_batch[:, i] = submodel_pred[:, 0]
-                predictions[model_name] = pred_batch
-                print(pred_batch)
+                predicted_skills = pred_batch
+                predictions[model_name] = predicted_skills
             else:  # Single model case
-                # Check if model has the predict method
+                # Check if the model has the predict method
                 if hasattr(model, 'predict'):
                     preds = model.predict(tfidf_summary_vectors)
                     if isinstance(preds, np.ndarray):
@@ -100,18 +121,26 @@ def make_predictions(examples, models, tfidf_vectorizer_summary, tokenizer, dist
                         else:
                             predicted_skills = np.where(preds > 0.5, 1, 0)
                         predictions[model_name] = predicted_skills
-                        print(predicted_skills)
                     else:
-                        print(f"The predictions from {model_name} are not of the expected type")
+                        print(f"The predictions from {model_name} are not in the expected format")
                 else:
-                    print(f"The model {model_name} does not have the predict method")
+                    print(f"The model {model_name} does not have a predict method")
+                    continue  # Move to the next model
+
+            # Display the predicted skill names
+            for i, sample_preds in enumerate(predicted_skills):
+                skill_indices = np.where(sample_preds == 1)[0]
+                skill_names = [index_to_skill[idx] for idx in skill_indices]
+                print(f"Example {i+1}")
+                print(f"Skills predicted by {model_name}: {skill_names}\n")
+
         except Exception as e:
-            print(f"Error in prediction with {model_name}: {str(e)}")
+            print(f"Error making predictions with {model_name}: {str(e)}")
             continue
 
-    # Prediction with DistilBERT
-    print("\nPrediction with DistilBERT:")
-    for text in examples:
+    # Predictions with DistilBERT
+    print("\nPredictions with DistilBERT:")
+    for i, text in enumerate(examples):
         try:
             inputs = tokenizer(
                 text,
@@ -122,12 +151,13 @@ def make_predictions(examples, models, tfidf_vectorizer_summary, tokenizer, dist
             )
             logits = distilbert_model(inputs).logits
             preds = tf.sigmoid(logits).numpy()[0]
-            predicted_labels = [i for i, pred in enumerate(preds) if pred >= 0.5]
-            print(f"Text: {text}")
-            print(f"Predicted skills: {predicted_labels}")
+            skill_indices = [i for i, pred in enumerate(preds) if pred >= 0.5]
+            skill_names = [index_to_skill[idx] for idx in skill_indices]
+            print(f"Example {i+1}")
+            print(f"Skills predicted by DistilBERT: {skill_names}\n")
         except Exception as e:
-            print(f"Error in prediction with DistilBERT: {str(e)}")
-    
+            print(f"Error making predictions with DistilBERT: {str(e)}")
+        
     return predictions
 
 def main():
@@ -137,7 +167,7 @@ def main():
     # Load ML models
     models = load_models()
     
-    # Load DistilBERT tokenizer and model
+    # Load tokenizer and DistilBERT model
     try:
         tokenizer = DistilBertTokenizerFast.from_pretrained(models_dir + '/distilbert')
         distilbert_model = TFDistilBertForSequenceClassification.from_pretrained(models_dir + '/distilbert')
@@ -146,15 +176,18 @@ def main():
         print(f"Error loading DistilBERT: {str(e)}")
         return
 
-    # Text examples for prediction
+    # Get the index-to-skill mapping from the binarized CSV
+    skills_binarized_csv_path = 'dataset_skills_binarized.csv'  # Adjust path if needed
+    index_to_skill = get_index_to_skill_mapping(skills_binarized_csv_path)
+    
+    # Example texts for prediction
     examples = [
-        "Data Analyst with SQL and Python experience needed for a fast-growing tech startup.",
-        "Seeking a Software Engineer skilled in Java and cloud computing for a multinational company.",
-        "Marketing specialist with experience in social media strategies and SEO."
+        """...""",  # Example 1 text
+        """..."""   # Example 2 text
     ]
 
     # Make predictions
-    predictions = make_predictions(examples, models, tfidf_vectorizer_summary, tokenizer, distilbert_model)
+    predictions = make_predictions(examples, models, tfidf_vectorizer_summary, tokenizer, distilbert_model, index_to_skill)
 
 if __name__ == "__main__":
     main()
